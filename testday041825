@@ -1,0 +1,302 @@
+% Save this as complete_pipe_simulation.m
+function complete_pipe_simulation()
+    % Load the STL file
+    stlFilename = 'Pipe for matlab code.STL';
+    fv = stlread(stlFilename);
+    vertices = fv.Points;
+    faces = fv.ConnectivityList;
+    
+    % Display original STL mesh
+    figure('Position', [100, 100, 600, 500]);
+    trisurf(faces, vertices(:,1), vertices(:,2), vertices(:,3), ...
+        'FaceColor', 'cyan', 'EdgeColor', 'none', 'FaceAlpha', 0.3);
+    axis equal;
+    grid on;
+    xlabel('X (mm)'); ylabel('Y (mm)'); zlabel('Z (mm)');
+    title('Original STL Pipe Geometry');
+    view(3);
+    lighting gouraud;
+    camlight;
+    hold on;
+    
+    % Extract the centerline
+    disp('Extracting centerline...');
+    centerline = extract_centerline(vertices, faces);
+    
+    % Display centerline
+    plot3(centerline(:,1), centerline(:,2), centerline(:,3), 'r.-', 'LineWidth', 1.5, 'MarkerSize', 8);
+    legend('Pipe Surface', 'Centerline', 'Location', 'northeast');
+    drawnow;
+    
+    % Define tool properties - Tapered cylindrical tool
+    baseRadius = 0.475/2; % Base diameter of 0.475 mm
+    tipRadius = 0.35/2;   % Tip diameter of 0.35 mm
+    toolLength = 5.5;     % Length of 5.5 mm
+    
+    % Number of simulation steps
+    numSteps = 100;
+    
+    % Wait for user to proceed
+    disp('Press any key to begin the tool animation...');
+    pause;
+    
+    % Simulate tool motion along centerline
+    animate_tool_motion(vertices, faces, centerline, baseRadius, tipRadius, toolLength, numSteps);
+end
+
+function centerline = extract_centerline(vertices, faces)
+    % Simplified centerline extraction based on cross sections
+    
+    % Find extreme points in each dimension
+    minX = min(vertices(:, 1)); maxX = max(vertices(:, 1));
+    minY = min(vertices(:, 2)); maxY = max(vertices(:, 2));
+    minZ = min(vertices(:, 3)); maxZ = max(vertices(:, 3));
+    
+    % Determine main axis (longest dimension)
+    dimensions = [maxX-minX, maxY-minY, maxZ-minZ];
+    [~, mainAxis] = max(dimensions);
+    
+    % Set up perpendicular axes
+    otherAxes = setdiff([1,2,3], mainAxis);
+    
+    % Create slices along the main axis
+    numSlices = 50;
+    slicePositions = linspace(min(vertices(:, mainAxis)), max(vertices(:, mainAxis)), numSlices);
+    
+    % Initialize centerline points
+    centerPoints = zeros(numSlices, 3);
+    validSlices = false(numSlices, 1);
+    
+    % Extract center of each cross-section
+    for i = 1:numSlices
+        % Get vertices near this slice
+        slicePos = slicePositions(i);
+        tolerance = (max(vertices(:, mainAxis)) - min(vertices(:, mainAxis))) / (numSlices * 2);
+        sliceIndices = find(abs(vertices(:, mainAxis) - slicePos) < tolerance);
+        
+        if length(sliceIndices) > 10
+            % Calculate center of this slice
+            slicePoints = vertices(sliceIndices, :);
+            centerPoints(i, :) = mean(slicePoints, 1);
+            validSlices(i) = true;
+        end
+    end
+    
+    % Keep only valid points
+    centerline = centerPoints(validSlices, :);
+    
+    % Smooth the centerline
+    centerline = smooth_centerline(centerline);
+    
+    % Ensure consistent direction (start to end)
+    d = diff(centerline);
+    consistentDirection = sum(d(:, mainAxis)) > 0;
+    if ~consistentDirection
+        centerline = flipud(centerline);
+    end
+    
+    % Densify the centerline for smoother motion
+    centerline = densify_centerline(centerline, 200);
+end
+
+function smoothedLine = smooth_centerline(centerline)
+    % Apply a moving average filter to smooth the centerline
+    windowSize = 5;
+    numPoints = size(centerline, 1);
+    
+    if numPoints <= windowSize
+        smoothedLine = centerline;
+        return;
+    end
+    
+    smoothedLine = centerline;
+    for i = 1:numPoints
+        startIdx = max(1, i - floor(windowSize/2));
+        endIdx = min(numPoints, i + floor(windowSize/2));
+        smoothedLine(i, :) = mean(centerline(startIdx:endIdx, :), 1);
+    end
+end
+
+function denseLine = densify_centerline(centerline, numPoints)
+    % Create more points along the centerline for smoother animation
+    segments = diff(centerline);
+    segmentLengths = sqrt(sum(segments.^2, 2));
+    cumDist = [0; cumsum(segmentLengths)];
+    
+    newDist = linspace(0, cumDist(end), numPoints);
+    
+    denseLine = zeros(numPoints, 3);
+    for dim = 1:3
+        denseLine(:,dim) = interp1(cumDist, centerline(:,dim), newDist, 'pchip');
+    end
+end
+
+function animate_tool_motion(pipeVertices, pipeFaces, centerline, baseRadius, tipRadius, toolLength, numSteps)
+    % Create a new figure for the animation
+    figure('Position', [100, 100, 1200, 800]);
+    
+    % Display the pipe
+    h_pipe = trisurf(pipeFaces, pipeVertices(:,1), pipeVertices(:,2), pipeVertices(:,3), ...
+        'FaceColor', [0.8, 0.8, 0.8], 'FaceAlpha', 0.3, 'EdgeColor', 'none');
+    hold on;
+    
+    % Display the centerline
+    plot3(centerline(:,1), centerline(:,2), centerline(:,3), 'r-', 'LineWidth', 1.5);
+    
+    % Set up the axes
+    axis equal;
+    grid on;
+    xlabel('X (mm)'); ylabel('Y (mm)'); zlabel('Z (mm)');
+    title('Tapered Cylindrical Tool Moving Through Pipe');
+    view(3);
+    light('Position',[1 1 1],'Style','infinite');
+    lighting gouraud;
+    
+    % Create path interpolation
+    waypoints = interpolate_path(centerline, numSteps);
+    
+    % Calculate tangent directions
+    tangents = calculate_tangents(waypoints);
+    
+    % Initialize tool
+    halfLength = toolLength / 2;
+    nSides = 16; % Number of sides for the cylinder
+    
+    % Create initial tool
+    startPt = waypoints(1,:) - halfLength * tangents(1,:);
+    endPt = waypoints(1,:) + halfLength * tangents(1,:);
+    [toolVerts, toolFaces] = create_tapered_cylinder(startPt, endPt, baseRadius, tipRadius, nSides);
+    
+    % Initialize tool visualization
+    h_tool = trisurf(toolFaces, toolVerts(:,1), toolVerts(:,2), toolVerts(:,3), ...
+        'FaceColor', [0.2, 0.6, 0.9], 'EdgeColor', 'none');
+    
+    % Animation loop
+    for i = 1:numSteps
+        % Get current position and direction
+        curPos = waypoints(i,:);
+        curTan = tangents(i,:);
+        
+        % Calculate progress (for gradual tapering)
+        progress = (i-1) / (numSteps-1);
+        
+        % Place tool at current position
+        startPt = curPos - halfLength * curTan;
+        endPt = curPos + halfLength * curTan;
+        
+        % Create tapered cylinder
+        [toolVerts, toolFaces] = create_tapered_cylinder(startPt, endPt, baseRadius, tipRadius, nSides);
+        
+        % Update visualization
+        set(h_tool, 'Vertices', toolVerts);
+        set(h_tool, 'Faces', toolFaces);
+        
+        % Add position marker
+        plot3(curPos(1), curPos(2), curPos(3), 'go', 'MarkerFaceColor', 'g', 'MarkerSize', 5);
+        
+        % Update display
+        drawnow;
+        pause(0.05);
+    end
+    
+    disp('Animation complete!');
+end
+
+function waypoints = interpolate_path(centerline, numPoints)
+    % Interpolate points along the centerline for smooth motion
+    segments = diff(centerline);
+    segmentLengths = sqrt(sum(segments.^2, 2));
+    cumDist = [0; cumsum(segmentLengths)];
+    
+    newDist = linspace(0, cumDist(end), numPoints);
+    
+    waypoints = zeros(numPoints, 3);
+    for dim = 1:3
+        waypoints(:,dim) = interp1(cumDist, centerline(:,dim), newDist, 'pchip');
+    end
+end
+
+function tangents = calculate_tangents(waypoints)
+    % Calculate tangent directions along the path
+    numPoints = size(waypoints, 1);
+    tangents = zeros(numPoints, 3);
+    
+    % Interior points use central difference
+    for i = 2:numPoints-1
+        tangents(i,:) = waypoints(i+1,:) - waypoints(i-1,:);
+        tangents(i,:) = tangents(i,:) / norm(tangents(i,:));
+    end
+    
+    % End points use forward/backward difference
+    tangents(1,:) = waypoints(2,:) - waypoints(1,:);
+    tangents(1,:) = tangents(1,:) / norm(tangents(1,:));
+    
+    tangents(numPoints,:) = waypoints(numPoints,:) - waypoints(numPoints-1,:);
+    tangents(numPoints,:) = tangents(numPoints,:) / norm(tangents(numPoints,:));
+end
+
+function [cylinderVerts, cylinderFaces] = create_tapered_cylinder(startPoint, endPoint, baseRadius, tipRadius, nSides)
+    % Create a tapered cylinder from startPoint to endPoint
+    
+    % Direction vector
+    direction = endPoint - startPoint;
+    length = norm(direction);
+    direction = direction / length;
+    
+    % Create perpendicular vectors for the circular cross-sections
+    if abs(direction(3)) < 0.9
+        perpVector = cross(direction, [0, 0, 1]);
+    else
+        perpVector = cross(direction, [1, 0, 0]);
+    end
+    perpVector = perpVector / norm(perpVector);
+    
+    perpVector2 = cross(direction, perpVector);
+    perpVector2 = perpVector2 / norm(perpVector2);
+    
+    % Generate base circle vertices
+    basePoints = zeros(nSides, 3);
+    for i = 1:nSides
+        angle = 2 * pi * (i-1) / nSides;
+        basePoints(i, :) = startPoint + baseRadius * (cos(angle) * perpVector + sin(angle) * perpVector2);
+    end
+    
+    % Generate tip circle vertices
+    tipPoints = zeros(nSides, 3);
+    for i = 1:nSides
+        angle = 2 * pi * (i-1) / nSides;
+        tipPoints(i, :) = endPoint + tipRadius * (cos(angle) * perpVector + sin(angle) * perpVector2);
+    end
+    
+    % Combine all vertices
+    cylinderVerts = [basePoints; tipPoints; startPoint; endPoint];
+    
+    % Create side faces
+    cylinderFaces = zeros(2*nSides, 3);
+    for i = 1:nSides
+        next = mod(i, nSides) + 1;
+        
+        % First triangle of quad
+        cylinderFaces(2*i-1, :) = [i, next, i + nSides];
+        
+        % Second triangle of quad
+        cylinderFaces(2*i, :) = [next, next + nSides, i + nSides];
+    end
+    
+    % Create base cap faces
+    baseFaces = zeros(nSides, 3);
+    for i = 1:nSides
+        next = mod(i, nSides) + 1;
+        baseFaces(i, :) = [2*nSides + 1, next, i];
+    end
+    
+    % Create tip cap faces
+    tipFaces = zeros(nSides, 3);
+    for i = 1:nSides
+        next = mod(i, nSides) + 1;
+        tipFaces(i, :) = [2*nSides + 2, i + nSides, next + nSides];
+    end
+    
+    % Combine all faces
+    cylinderFaces = [cylinderFaces; baseFaces; tipFaces];
+end
