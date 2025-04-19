@@ -1,0 +1,437 @@
+% Save this as pipe_simulation_fixed.m
+function pipe_simulation_fixed()
+    % Load the STL file
+    stlFilename = 'Pipe for matlab code.STL';
+    fv = stlread(stlFilename);
+    vertices = fv.Points;
+    faces = fv.ConnectivityList;
+    
+    % Display original STL mesh
+    figure('Position', [100, 100, 600, 500]);
+    trisurf(faces, vertices(:,1), vertices(:,2), vertices(:,3), ...
+        'FaceColor', 'cyan', 'EdgeColor', 'none', 'FaceAlpha', 0.3);
+    axis equal; grid on;
+    xlabel('X (mm)'); ylabel('Y (mm)'); zlabel('Z (mm)');
+    title('Original STL Pipe Geometry');
+    view(3); lighting gouraud; camlight;
+    hold on;
+    
+    % Find pipe endpoints using PCA
+    disp('Detecting pipe endpoints...');
+    [startPoint, endPoint] = find_pipe_endpoints(vertices);
+    
+    % Extract centerline
+    disp('Extracting centerline...');
+    centerline = extract_centerline(vertices, faces, startPoint, endPoint);
+    
+    % Display centerline
+    plot3(centerline(:,1), centerline(:,2), centerline(:,3), 'r.-', 'LineWidth', 1.5, 'MarkerSize', 8);
+    plot3(startPoint(1), startPoint(2), startPoint(3), 'go', 'MarkerFaceColor', 'g', 'MarkerSize', 10);
+    plot3(endPoint(1), endPoint(2), endPoint(3), 'ro', 'MarkerFaceColor', 'r', 'MarkerSize', 10);
+    legend('Pipe', 'Centerline', 'Entry Point', 'Exit Point');
+    
+    % Tool properties
+    baseRadius = 0.475/2; % Base diameter of 0.475 mm
+    tipRadius = 0.35/2;   % Tip diameter of 0.35 mm
+    toolLength = 5.5;     % Length of 5.5 mm
+    
+    % Simulate tool motion
+    disp('Press any key to begin animation...');
+    pause;
+    animate_tool(vertices, faces, centerline, baseRadius, tipRadius, toolLength);
+end
+
+function [startPoint, endPoint] = find_pipe_endpoints(vertices)
+    % Simple endpoint detection using PCA
+    centeredVerts = vertices - mean(vertices, 1);
+    [~, ~, V] = svd(centeredVerts, 'econ');
+    pipeAxis = V(:,1);
+    
+    % Project vertices onto pipe axis
+    projections = vertices * pipeAxis;
+    [~, minIdx] = min(projections);
+    [~, maxIdx] = max(projections);
+    startPoint = vertices(minIdx, :);
+    endPoint = vertices(maxIdx, :);
+    
+    disp(['Start point: [', num2str(startPoint), ']']);
+    disp(['End point: [', num2str(endPoint), ']']);
+end
+
+function centerline = extract_centerline(vertices, faces, startPoint, endPoint)
+    % Parameters
+    stepSize = 0.5;       % Step size in mm
+    slabThickness = 0.8;  % Cross-section thickness
+    maxSteps = 1000;      % Maximum steps
+    reachTolerance = 1.5; % Distance tolerance to endpoint
+    
+    % Initialize centerline with start point
+    centerline = startPoint;
+    currentDirection = normalize(endPoint - startPoint);
+    
+    % March through the pipe
+    step = 1;
+    while step < maxSteps
+        currentPoint = centerline(end, :);
+        distToEnd = norm(currentPoint - endPoint);
+        
+        % Check if endpoint reached
+        if distToEnd < reachTolerance
+            disp(['Endpoint reached after ', num2str(step), ' steps']);
+            break;
+        end
+        
+        % Update direction with endpoint bias
+        if size(centerline, 1) >= 3
+            recentDir = normalize(centerline(end, :) - centerline(end-1, :));
+            endDir = normalize(endPoint - currentPoint);
+            endWeight = min(0.4, 0.1 + 0.3*(1 - min(1, distToEnd/10)));
+            currentDirection = normalize((1-endWeight)*recentDir + endWeight*endDir);
+        elseif size(centerline, 1) >= 2
+            recentDir = normalize(centerline(end, :) - centerline(end-1, :));
+            endDir = normalize(endPoint - currentPoint);
+            currentDirection = normalize(0.7*recentDir + 0.3*endDir);
+        else
+            currentDirection = normalize(endPoint - currentPoint);
+        end
+        
+        % Advance to next position
+        nextPoint = currentPoint + stepSize * currentDirection;
+        
+        % Create cross-section plane
+        planePoint = nextPoint;
+        planeNormal = currentDirection;
+        
+        % Find nearby vertices
+        distances = abs(dot(vertices - planePoint, repmat(planeNormal, size(vertices, 1), 1), 2));
+        nearIndices = find(distances < slabThickness);
+        
+        % Handle insufficient points
+        if length(nearIndices) < 10
+            expandedThickness = slabThickness * 2;
+            nearIndices = find(distances < expandedThickness);
+            
+            if length(nearIndices) < 10
+                disp('Warning: Insufficient points for cross-section. Marching directly toward endpoint.');
+                nextPoint = currentPoint + stepSize * normalize(endPoint - currentPoint);
+                centerline = [centerline; nextPoint];
+                step = step + 1;
+                continue;
+            end
+        end
+        
+        % Get cross-section center
+        sliceVerts = vertices(nearIndices, :);
+        crossSectionCenter = get_cross_section_center(sliceVerts, planePoint, planeNormal);
+        centerline = [centerline; crossSectionCenter];
+        
+        % Progress reporting
+        if mod(step, 10) == 0
+            disp(['Step ', num2str(step), ': Distance to endpoint: ', num2str(distToEnd), ' mm']);
+        end
+        
+        step = step + 1;
+    end
+    
+    % Connect to endpoint if needed
+    if norm(centerline(end, :) - endPoint) > reachTolerance
+        disp('Adding connecting segment to endpoint...');
+        connectingPoints = connect_to_endpoint(centerline, endPoint);
+        centerline = [centerline; connectingPoints];
+    end
+    
+    % Smooth and densify
+    centerline = smooth_centerline(centerline);
+    centerline = densify_centerline(centerline, 200);
+end
+
+function center = get_cross_section_center(sliceVerts, planePoint, planeNormal)
+    % Project vertices onto the plane
+    projectedVerts = zeros(size(sliceVerts));
+    for i = 1:size(sliceVerts, 1)
+        proj = dot(sliceVerts(i, :) - planePoint, planeNormal);
+        projectedVerts(i, :) = sliceVerts(i, :) - proj * planeNormal;
+    end
+    
+    % Create basis vectors for 2D projection
+    if abs(planeNormal(3)) < 0.9
+        u1 = cross(planeNormal, [0, 0, 1]);
+    else
+        u1 = cross(planeNormal, [1, 0, 0]);
+    end
+    u1 = u1 / norm(u1);
+    u2 = cross(planeNormal, u1);
+    u2 = u2 / norm(u2);
+    
+    % Get initial center estimate
+    initialCenter = mean(projectedVerts, 1);
+    
+    % Convert to 2D
+    points2D = zeros(size(projectedVerts, 1), 2);
+    for i = 1:size(projectedVerts, 1)
+        relVector = projectedVerts(i, :) - initialCenter;
+        points2D(i, 1) = dot(relVector, u1);
+        points2D(i, 2) = dot(relVector, u2);
+    end
+    
+    % Find center using convex hull
+    try
+        k = convhull(points2D);
+        hullPoints = points2D(k, :);
+        center2D = mean(hullPoints, 1);
+        center = initialCenter + center2D(1) * u1 + center2D(2) * u2;
+    catch
+        center = initialCenter;
+    end
+end
+
+function connectingPoints = connect_to_endpoint(centerline, endPoint)
+    numPoints = size(centerline, 1);
+    lastPoint = centerline(end, :);
+    
+    % Get direction from last points
+    if numPoints >= 3
+        recentDir = normalize(centerline(end, :) - centerline(end-2, :));
+    else
+        recentDir = normalize(centerline(end, :) - centerline(1, :));
+    end
+    
+    % Distance to endpoint
+    distToEnd = norm(endPoint - lastPoint);
+    
+    % Number of connecting points
+    numConnectingPoints = max(5, ceil(distToEnd / 0.5));
+    
+    % Create parameter values for the curve
+    t = linspace(0, 1, numConnectingPoints);
+    
+    % Create control points
+    p0 = lastPoint;
+    p1 = lastPoint + recentDir * distToEnd * 0.33;
+    p2 = endPoint - normalize(endPoint - p1) * distToEnd * 0.33;
+    p3 = endPoint;
+    
+    % Create connecting points using Bezier curve
+    connectingPoints = zeros(numConnectingPoints, 3);
+    for i = 1:numConnectingPoints
+        u = t(i);
+        connectingPoints(i, :) = (1-u)^3 * p0 + 3*(1-u)^2*u * p1 + 3*(1-u)*u^2 * p2 + u^3 * p3;
+    end
+    
+    % Remove first point (duplicate of last centerline point)
+    connectingPoints = connectingPoints(2:end, :);
+end
+
+function smoothedLine = smooth_centerline(centerline)
+    numPoints = size(centerline, 1);
+    if numPoints <= 5
+        smoothedLine = centerline;
+        return;
+    end
+    
+    windowSize = 5;
+    halfWindow = floor(windowSize/2);
+    smoothedLine = centerline;
+    
+    for i = 1:numPoints
+        startIdx = max(1, i - halfWindow);
+        endIdx = min(numPoints, i + halfWindow);
+        smoothedLine(i, :) = mean(centerline(startIdx:endIdx, :), 1);
+    end
+end
+
+function denseLine = densify_centerline(centerline, numPoints)
+    segments = diff(centerline);
+    segmentLengths = sqrt(sum(segments.^2, 2));
+    cumDist = [0; cumsum(segmentLengths)];
+    
+    newDist = linspace(0, cumDist(end), numPoints);
+    
+    denseLine = zeros(numPoints, 3);
+    for dim = 1:3
+        denseLine(:,dim) = interp1(cumDist, centerline(:,dim), newDist, 'pchip');
+    end
+end
+
+function animate_tool(vertices, faces, centerline, baseRadius, tipRadius, toolLength)
+    % Create figure for animation
+    figure('Position', [100, 100, 1200, 800]);
+    
+    % Display pipe
+    trisurf(faces, vertices(:,1), vertices(:,2), vertices(:,3), ...
+        'FaceColor', [0.8, 0.8, 0.8], 'FaceAlpha', 0.3, 'EdgeColor', 'none');
+    hold on;
+    
+    % Display centerline
+    plot3(centerline(:,1), centerline(:,2), centerline(:,3), 'r-', 'LineWidth', 1.5);
+    
+    % Setup view
+    axis equal; grid on;
+    xlabel('X (mm)'); ylabel('Y (mm)'); zlabel('Z (mm)');
+    title('Tool Motion Through Pipe');
+    view(3); lighting gouraud;
+    light('Position', [1, 1, 1], 'Style', 'infinite');
+    
+    % Create waypoints
+    numSteps = 100;
+    waypoints = interpolate_path(centerline, numSteps);
+    
+    % Calculate tangent directions
+    tangents = calculate_tangents(waypoints);
+    
+    % Create tool
+    halfLength = toolLength / 2;
+    nSides = 16;
+    
+    % Initial tool position
+    startPt = waypoints(1,:) - halfLength * tangents(1,:);
+    endPt = waypoints(1,:) + halfLength * tangents(1,:);
+    [toolVerts, toolFaces] = create_tapered_cylinder(startPt, endPt, baseRadius, tipRadius, nSides);
+    
+    % Tool visualization
+    h_tool = trisurf(toolFaces, toolVerts(:,1), toolVerts(:,2), toolVerts(:,3), ...
+        'FaceColor', [0.2, 0.6, 0.9], 'EdgeColor', 'none');
+    
+    % Animation controls
+    uicontrol('Style', 'text', 'String', 'Speed:', 'Position', [20, 70, 60, 20]);
+    speedSlider = uicontrol('Style', 'slider', 'Min', 0.01, 'Max', 0.2, 'Value', 0.05, ...
+        'Position', [20, 50, 100, 20]);
+    
+    cameraFollow = true;
+    camFollowCheck = uicontrol('Style', 'checkbox', 'String', 'Follow Tool', ...
+        'Position', [20, 20, 100, 20], 'Value', cameraFollow);
+    
+    % Animation loop
+    for i = 1:numSteps
+        % Current position and direction
+        curPos = waypoints(i,:);
+        curTan = tangents(i,:);
+        
+        % Progress for radius tapering
+        progress = (i-1) / (numSteps-1);
+        
+        % Place tool
+        startPt = curPos - halfLength * curTan;
+        endPt = curPos + halfLength * curTan;
+        [toolVerts, toolFaces] = create_tapered_cylinder(startPt, endPt, baseRadius, tipRadius, nSides);
+        
+        % Update tool
+        set(h_tool, 'Vertices', toolVerts);
+        set(h_tool, 'Faces', toolFaces);
+        
+        % Add path marker
+        plot3(curPos(1), curPos(2), curPos(3), 'go', 'MarkerFaceColor', 'g', 'MarkerSize', 5);
+        
+        % Camera control
+        cameraFollow = get(camFollowCheck, 'Value');
+        if cameraFollow
+            camtarget(curPos);
+            camva(40);
+            viewOffset = 10;
+            camPos = curPos - viewOffset * curTan;
+            camposition(camPos);
+        end
+        
+        % Animation speed
+        pauseTime = get(speedSlider, 'Value');
+        
+        % Update display
+        drawnow;
+        pause(pauseTime);
+    end
+end
+
+function waypoints = interpolate_path(centerline, numPoints)
+    segments = diff(centerline);
+    segmentLengths = sqrt(sum(segments.^2, 2));
+    cumDist = [0; cumsum(segmentLengths)];
+    
+    newDist = linspace(0, cumDist(end), numPoints);
+    
+    waypoints = zeros(numPoints, 3);
+    for dim = 1:3
+        waypoints(:,dim) = interp1(cumDist, centerline(:,dim), newDist, 'pchip');
+    end
+end
+
+function tangents = calculate_tangents(waypoints)
+    numPoints = size(waypoints, 1);
+    tangents = zeros(numPoints, 3);
+    
+    % Interior points
+    for i = 2:numPoints-1
+        tangents(i,:) = waypoints(i+1,:) - waypoints(i-1,:);
+        tangents(i,:) = tangents(i,:) / norm(tangents(i,:));
+    end
+    
+    % End points
+    tangents(1,:) = waypoints(2,:) - waypoints(1,:);
+    tangents(1,:) = tangents(1,:) / norm(tangents(1,:));
+    
+    tangents(numPoints,:) = waypoints(numPoints,:) - waypoints(numPoints-1,:);
+    tangents(numPoints,:) = tangents(numPoints,:) / norm(tangents(numPoints,:));
+end
+
+function [cylinderVerts, cylinderFaces] = create_tapered_cylinder(startPoint, endPoint, baseRadius, tipRadius, nSides)
+    % Direction vector
+    direction = endPoint - startPoint;
+    length = norm(direction);
+    direction = direction / length;
+    
+    % Create perpendicular vectors
+    if abs(direction(3)) < 0.9
+        perpVector = cross(direction, [0, 0, 1]);
+    else
+        perpVector = cross(direction, [1, 0, 0]);
+    end
+    perpVector = perpVector / norm(perpVector);
+    
+    perpVector2 = cross(direction, perpVector);
+    perpVector2 = perpVector2 / norm(perpVector2);
+    
+    % Base circle
+    basePoints = zeros(nSides, 3);
+    for i = 1:nSides
+        angle = 2 * pi * (i-1) / nSides;
+        basePoints(i, :) = startPoint + baseRadius * (cos(angle) * perpVector + sin(angle) * perpVector2);
+    end
+    
+    % Tip circle
+    tipPoints = zeros(nSides, 3);
+    for i = 1:nSides
+        angle = 2 * pi * (i-1) / nSides;
+        tipPoints(i, :) = endPoint + tipRadius * (cos(angle) * perpVector + sin(angle) * perpVector2);
+    end
+    
+    % Combine vertices
+    cylinderVerts = [basePoints; tipPoints; startPoint; endPoint];
+    
+    % Side faces
+    cylinderFaces = zeros(2*nSides, 3);
+    for i = 1:nSides
+        next = mod(i, nSides) + 1;
+        cylinderFaces(2*i-1, :) = [i, next, i + nSides];
+        cylinderFaces(2*i, :) = [next, next + nSides, i + nSides];
+    end
+    
+    % Base cap
+    baseFaces = zeros(nSides, 3);
+    for i = 1:nSides
+        next = mod(i, nSides) + 1;
+        baseFaces(i, :) = [2*nSides + 1, next, i];
+    end
+    
+    % Tip cap
+    tipFaces = zeros(nSides, 3);
+    for i = 1:nSides
+        next = mod(i, nSides) + 1;
+        tipFaces(i, :) = [2*nSides + 2, i + nSides, next + nSides];
+    end
+    
+    % Combine faces
+    cylinderFaces = [cylinderFaces; baseFaces; tipFaces];
+end
+
+function v = normalize(vector)
+    v = vector / norm(vector);
+    endk
