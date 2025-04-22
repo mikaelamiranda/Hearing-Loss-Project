@@ -1,0 +1,488 @@
+function electrode_insertion()
+    % ELECTRODE_INSERTION
+    % Simulate electrode insertion into an STL model with visualization
+    % and collision detection, with option to save video
+    
+    % Load the STL file
+    stlFilename = 'Pipe for matlab code.STL';
+    
+    % Check if file exists
+    if ~exist(stlFilename, 'file')
+        error('STL file not found: %s. Please check the path.', stlFilename);
+    end
+    
+    try
+        % Try reading with stlread
+        fv = stlread(stlFilename);
+        vertices = fv.Points;
+        faces = fv.ConnectivityList;
+    catch
+        error('Could not read STL file. Make sure stlread is available or the file is valid.');
+    end
+    
+    % Display original STL mesh
+    figure('Position', [100, 100, 600, 500]);
+    trisurf(faces, vertices(:,1), vertices(:,2), vertices(:,3), ...
+        'FaceColor', 'cyan', 'EdgeColor', 'none', 'FaceAlpha', 0.3);
+    axis equal;
+    grid on;
+    xlabel('X (mm)'); ylabel('Y (mm)'); zlabel('Z (mm)');
+    title('Original STL Pipe Geometry');
+    view(3);
+    lighting gouraud;
+    camlight;
+    hold on;
+    
+    % Extract the centerline
+    disp('Extracting centerline...');
+    centerline = extract_centerline(vertices, faces);
+    
+    % Display centerline
+    plot3(centerline(:,1), centerline(:,2), centerline(:,3), 'r.-', 'LineWidth', 1.5, 'MarkerSize', 8);
+    legend('Pipe Surface', 'Centerline', 'Location', 'northeast');
+    drawnow;
+    
+    % Define electrode properties
+    baseRadius = 0.475/2; % Base diameter of 0.475 mm
+    tipRadius = 0.35/2;   % Tip diameter of 0.35 mm
+    toolLength = 5.5;     % Length of 5.5 mm
+    
+    % Number of simulation steps
+    numSteps = 100;
+    
+    % Ask if user wants to save video
+    saveVideo = false;
+    videoFilename = '';
+    videoChoice = questdlg('Would you like to save the animation as a video?', ...
+        'Video Export', 'Yes', 'No', 'No');
+    if strcmp(videoChoice, 'Yes')
+        saveVideo = true;
+        [videoFilename, videoPath] = uiputfile({'*.mp4', 'MP4 Video (*.mp4)'; ...
+                                              '*.avi', 'AVI Video (*.avi)'}, ...
+                                              'Save Animation As', 'electrode_insertion.mp4');
+        if isequal(videoFilename, 0)
+            saveVideo = false;
+            disp('Video export cancelled.');
+        else
+            videoFilename = fullfile(videoPath, videoFilename);
+            disp(['Animation will be saved to: ', videoFilename]);
+        end
+    end
+    
+    % Wait for user to proceed
+    disp('Press any key to begin the electrode animation...');
+    pause;
+    
+    % Simulate electrode motion along centerline
+    animate_electrode_motion(vertices, faces, centerline, baseRadius, tipRadius, toolLength, numSteps, saveVideo, videoFilename);
+end
+
+function centerline = extract_centerline(vertices, faces)
+    % Improved centerline extraction based on cross sections
+    
+    % Step 1: Find extreme points in each dimension
+    minX = min(vertices(:, 1)); maxX = max(vertices(:, 1));
+    minY = min(vertices(:, 2)); maxY = max(vertices(:, 2));
+    minZ = min(vertices(:, 3)); maxZ = max(vertices(:, 3));
+    
+    % Step 2: Find the main axis using PCA
+    centeredPoints = vertices - mean(vertices, 1);
+    [~, ~, V] = svd(centeredPoints, 'econ');
+    mainDirection = V(:, 1)';
+    
+    % Step 3: Project vertices onto main axis for analysis
+    projections = centeredPoints * mainDirection';
+    maxProj = max(projections);
+    minProj = min(projections);
+    
+    % Create slices along the main axis
+    numSlices = 80; % Increased for better accuracy
+    slicePositions = linspace(minProj, maxProj, numSlices);
+    
+    % Initialize centerline points
+    centerPoints = zeros(numSlices, 3);
+    validSlices = false(numSlices, 1);
+    
+    % Extract center of each cross-section
+    meanPoint = mean(vertices, 1);
+    
+    for i = 1:numSlices
+        % Get vertices near this slice
+        slicePos = slicePositions(i);
+        tolerance = (maxProj - minProj) / (numSlices * 1.5); % Adjusted tolerance
+        
+        % Find points near the slice plane
+        sliceIndices = find(abs(projections - slicePos) < tolerance);
+        
+        if length(sliceIndices) >= 5 % Need at least 5 points for a good centroid
+            % Get the 3D points for this slice
+            slicePoints = vertices(sliceIndices, :);
+            
+            % Project points to a plane perpendicular to the main axis
+            planePoint = meanPoint + slicePos * mainDirection;
+            projectedPoints = project_to_plane(slicePoints, planePoint, mainDirection);
+            
+            % If possible, use the convex hull center for more accuracy
+            try
+                % Find 2D basis for the plane
+                localPoints = projectedPoints - mean(projectedPoints, 1);
+                [U, ~, ~] = svd(localPoints, 'econ');
+                basis1 = U(:, 1)';
+                basis2 = U(:, 2)';
+                
+                % Project to 2D
+                points2D = [(localPoints * basis1')', (localPoints * basis2')'];
+                
+                % Get convex hull
+                k = convhull(points2D');
+                hullPoints = projectedPoints(k, :);
+                
+                % Calculate center of the hull
+                centerPoints(i, :) = mean(hullPoints, 1);
+            catch
+                % Fallback to simple centroid
+                centerPoints(i, :) = mean(projectedPoints, 1);
+            end
+            
+            validSlices(i) = true;
+        end
+    end
+    
+    % Keep only valid points
+    centerline = centerPoints(validSlices, :);
+    
+    % Sort points along the main axis if needed
+    projections = (centerline - mean(centerline, 1)) * mainDirection';
+    [~, sortIdx] = sort(projections);
+    centerline = centerline(sortIdx, :);
+    
+    % Smooth the centerline
+    centerline = smooth_centerline(centerline);
+    
+    % Densify the centerline for smoother motion
+    centerline = densify_centerline(centerline, 200);
+    
+    % Remove first 9 points and last 3 points from the centerline
+    if size(centerline, 1) > 12  % Only if we have enough points
+        centerline = centerline(10:end-3, :);
+        disp(['Trimmed centerline points: removed first 9 and last 3 points.']);
+        disp(['New centerline length: ' num2str(size(centerline, 1)) ' points']);
+    else
+        disp('Warning: Not enough points to trim the centerline as requested.');
+    end
+end
+
+function projPoints = project_to_plane(points, planePoint, planeNormal)
+    % Project points onto a plane defined by a point and normal
+    projPoints = zeros(size(points));
+    for i = 1:size(points, 1)
+        % Vector from plane point to current point
+        v = points(i, :) - planePoint;
+        
+        % Distance from point to plane
+        dist = dot(v, planeNormal);
+        
+        % Project point to plane
+        projPoints(i, :) = points(i, :) - dist * planeNormal;
+    end
+end
+
+function smoothedLine = smooth_centerline(centerline)
+    % Apply a moving average filter to smooth the centerline
+    windowSize = 5;
+    numPoints = size(centerline, 1);
+    
+    if numPoints <= windowSize
+        smoothedLine = centerline;
+        return;
+    end
+    
+    smoothedLine = centerline;
+    for i = 1:numPoints
+        startIdx = max(1, i - floor(windowSize/2));
+        endIdx = min(numPoints, i + floor(windowSize/2));
+        smoothedLine(i, :) = mean(centerline(startIdx:endIdx, :), 1);
+    end
+end
+
+function denseLine = densify_centerline(centerline, numPoints)
+    % Create more points along the centerline for smoother animation
+    % Skip if we don't have enough input points
+    if size(centerline, 1) < 3
+        denseLine = centerline;
+        return;
+    end
+    
+    % Calculate cumulative distance along the path
+    segments = diff(centerline);
+    segmentLengths = sqrt(sum(segments.^2, 2));
+    cumDist = [0; cumsum(segmentLengths)];
+    
+    % Create evenly spaced points
+    newDist = linspace(0, cumDist(end), numPoints);
+    
+    % Interpolate along the path
+    denseLine = zeros(numPoints, 3);
+    for dim = 1:3
+        denseLine(:,dim) = interp1(cumDist, centerline(:,dim), newDist, 'pchip');
+    end
+end
+
+function animate_electrode_motion(pipeVertices, pipeFaces, centerline, baseRadius, tipRadius, toolLength, numSteps, saveVideo, videoFilename)
+    % Create a new figure for the animation
+    fig = figure('Position', [100, 100, 1000, 800]);
+    
+    % Display the pipe
+    h_pipe = trisurf(pipeFaces, pipeVertices(:,1), pipeVertices(:,2), pipeVertices(:,3), ...
+        'FaceColor', [0.8, 0.8, 0.9], 'FaceAlpha', 0.3, 'EdgeColor', 'none');
+    hold on;
+    
+    % Display the centerline
+    plot3(centerline(:,1), centerline(:,2), centerline(:,3), 'r-', 'LineWidth', 1.5);
+    
+    % Set up the axes
+    axis equal;
+    grid on;
+    xlabel('X (mm)'); ylabel('Y (mm)'); zlabel('Z (mm)');
+    title('Electrode Moving Through Tubular Structure');
+    view(3);
+    light('Position',[1 1 1],'Style','infinite');
+    lighting gouraud;
+    
+    % Create path interpolation for the animation
+    waypoints = interpolate_path(centerline, numSteps);
+    
+    % Calculate tangent directions at each point
+    tangents = calculate_tangents(waypoints);
+    
+    % Initialize electrode parameters
+    halfLength = toolLength / 2;
+    nSides = 16; % Number of sides for the cylinder
+    
+    % Create initial electrode visualization
+    startPt = waypoints(1,:) - halfLength * tangents(1,:);
+    endPt = waypoints(1,:) + halfLength * tangents(1,:);
+    [electrodeVerts, electrodeFaces] = create_tapered_cylinder(startPt, endPt, baseRadius, tipRadius, nSides);
+    
+    % Initialize electrode visualization
+    h_electrode = trisurf(electrodeFaces, electrodeVerts(:,1), electrodeVerts(:,2), electrodeVerts(:,3), ...
+        'FaceColor', [0.2, 0.6, 0.9], 'EdgeColor', 'none');
+    
+    % Create a color gradient for the path
+    cmap = jet(numSteps);
+    h_path = [];
+    
+    % Set up video writer if saving video
+    if saveVideo
+        % Get file extension to determine video format
+        [~, ~, ext] = fileparts(videoFilename);
+        
+        % Choose appropriate video profile based on file extension
+        if strcmpi(ext, '.mp4')
+            videoObj = VideoWriter(videoFilename, 'MPEG-4');
+        else
+            videoObj = VideoWriter(videoFilename);  % Default to AVI
+        end
+        
+        % Set frame rate (frames per second)
+        videoObj.FrameRate = 30;
+        
+        % Set quality for AVI format
+        if strcmpi(ext, '.avi')
+            videoObj.Quality = 90;  % 0-100, higher is better quality
+        end
+        
+        % Open the video writer
+        open(videoObj);
+        
+        % Show progress bar for video export
+        vidWaitbar = waitbar(0, 'Preparing to record animation...', 'Name', 'Saving Video');
+    end
+    
+    % Animation loop
+    for i = 1:numSteps
+        % Get current position and direction
+        curPos = waypoints(i,:);
+        curTan = tangents(i,:);
+        
+        % Place electrode at current position
+        startPt = curPos - halfLength * curTan;
+        endPt = curPos + halfLength * curTan;
+        
+        % Create tapered cylinder for the electrode
+        [electrodeVerts, electrodeFaces] = create_tapered_cylinder(startPt, endPt, baseRadius, tipRadius, nSides);
+        
+        % Update visualization
+        set(h_electrode, 'Vertices', electrodeVerts);
+        set(h_electrode, 'Faces', electrodeFaces);
+        
+        % Add position marker with color from jet colormap
+        h_path(end+1) = plot3(curPos(1), curPos(2), curPos(3), 'o', ...
+            'MarkerFaceColor', cmap(i,:), 'MarkerEdgeColor', 'none', 'MarkerSize', 6);
+        
+        % Update title with progress
+        title(sprintf('Electrode Insertion: %.1f%% Complete', 100*i/numSteps));
+        
+        % Update display
+        drawnow;
+        
+        % Save frame to video if requested
+        if saveVideo
+            % Update waitbar
+            waitbar(i/numSteps, vidWaitbar, sprintf('Recording frame %d of %d...', i, numSteps));
+            
+            % Capture the current figure as a frame
+            frame = getframe(fig);
+            
+            % Write the frame to the video
+            writeVideo(videoObj, frame);
+        end
+        
+        % Pause for animation display
+        pause(0.03);
+    end
+    
+    % Add legend at the end
+    legend([h_pipe, h_electrode, h_path(1)], {'Tubular Structure', 'Electrode', 'Path Points'}, 'Location', 'northeast');
+    
+    % Close video writer if saving
+    if saveVideo
+        close(videoObj);
+        close(vidWaitbar);
+        disp(['Video saved to: ', videoFilename]);
+    end
+    
+    disp('Electrode insertion animation complete!');
+end
+
+function waypoints = interpolate_path(centerline, numPoints)
+    % Interpolate points along the centerline for smooth motion
+    % Skip if we don't have enough input points
+    if size(centerline, 1) < 3
+        waypoints = centerline;
+        return;
+    end
+    
+    % Calculate cumulative distance along the path
+    segments = diff(centerline);
+    segmentLengths = sqrt(sum(segments.^2, 2));
+    cumDist = [0; cumsum(segmentLengths)];
+    
+    % Create evenly spaced points
+    newDist = linspace(0, cumDist(end), numPoints);
+    
+    % Interpolate along the path
+    waypoints = zeros(numPoints, 3);
+    for dim = 1:3
+        waypoints(:,dim) = interp1(cumDist, centerline(:,dim), newDist, 'pchip');
+    end
+end
+
+function tangents = calculate_tangents(waypoints)
+    % Calculate tangent directions along the path
+    numPoints = size(waypoints, 1);
+    tangents = zeros(numPoints, 3);
+    
+    % Interior points use central difference
+    for i = 2:numPoints-1
+        tangents(i,:) = waypoints(i+1,:) - waypoints(i-1,:);
+        tangentMag = norm(tangents(i,:));
+        if tangentMag > 0
+            tangents(i,:) = tangents(i,:) / tangentMag;
+        else
+            % Handle zero-length tangent (rare)
+            if i > 2
+                tangents(i,:) = tangents(i-1,:);
+            else
+                tangents(i,:) = [0 0 1]; % Default
+            end
+        end
+    end
+    
+    % End points use forward/backward difference
+    tangents(1,:) = waypoints(2,:) - waypoints(1,:);
+    tangentMag = norm(tangents(1,:));
+    if tangentMag > 0
+        tangents(1,:) = tangents(1,:) / tangentMag;
+    else
+        tangents(1,:) = [0 0 1]; % Default
+    end
+    
+    tangents(numPoints,:) = waypoints(numPoints,:) - waypoints(numPoints-1,:);
+    tangentMag = norm(tangents(numPoints,:));
+    if tangentMag > 0
+        tangents(numPoints,:) = tangents(numPoints,:) / tangentMag;
+    else
+        tangents(numPoints,:) = tangents(numPoints-1,:);
+    end
+end
+
+function [cylinderVerts, cylinderFaces] = create_tapered_cylinder(startPoint, endPoint, baseRadius, tipRadius, nSides)
+    % Create a tapered cylinder from startPoint to endPoint
+    
+    % Direction vector
+    direction = endPoint - startPoint;
+    length = norm(direction);
+    if length > 0
+        direction = direction / length;
+    else
+        direction = [0 0 1]; % Default direction
+    end
+    
+    % Create perpendicular vectors for the circular cross-sections
+    if abs(direction(3)) < 0.9
+        perpVector = cross(direction, [0, 0, 1]);
+    else
+        perpVector = cross(direction, [1, 0, 0]);
+    end
+    
+    perpVector = perpVector / norm(perpVector);
+    perpVector2 = cross(direction, perpVector);
+    perpVector2 = perpVector2 / norm(perpVector2);
+    
+    % Generate base circle vertices
+    basePoints = zeros(nSides, 3);
+    for i = 1:nSides
+        angle = 2 * pi * (i-1) / nSides;
+        basePoints(i, :) = startPoint + baseRadius * (cos(angle) * perpVector + sin(angle) * perpVector2);
+    end
+    
+    % Generate tip circle vertices
+    tipPoints = zeros(nSides, 3);
+    for i = 1:nSides
+        angle = 2 * pi * (i-1) / nSides;
+        tipPoints(i, :) = endPoint + tipRadius * (cos(angle) * perpVector + sin(angle) * perpVector2);
+    end
+    
+    % Combine all vertices
+    cylinderVerts = [basePoints; tipPoints; startPoint; endPoint];
+    
+    % Create side faces
+    cylinderFaces = zeros(2*nSides, 3);
+    for i = 1:nSides
+        next = mod(i, nSides) + 1;
+        
+        % First triangle of quad
+        cylinderFaces(2*i-1, :) = [i, next, i + nSides];
+        
+        % Second triangle of quad
+        cylinderFaces(2*i, :) = [next, next + nSides, i + nSides];
+    end
+    
+    % Create base cap faces
+    baseFaces = zeros(nSides, 3);
+    for i = 1:nSides
+        next = mod(i, nSides) + 1;
+        baseFaces(i, :) = [2*nSides + 1, next, i];
+    end
+    
+    % Create tip cap faces
+    tipFaces = zeros(nSides, 3);
+    for i = 1:nSides
+        next = mod(i, nSides) + 1;
+        tipFaces(i, :) = [2*nSides + 2, i + nSides, next + nSides];
+    end
+    
+    % Combine all faces
+    cylinderFaces = [cylinderFaces; baseFaces; tipFaces];
+end
