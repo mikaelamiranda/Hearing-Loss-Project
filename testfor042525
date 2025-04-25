@@ -1,0 +1,659 @@
+function centerline = cochlea_centerline_extractor(stlFilename)
+    % COCHLEA_CENTERLINE_EXTRACTOR
+    % Automatically extracts a smooth centerline from a cochlear STL model
+    %
+    % Input:
+    %   stlFilename - path to the STL file
+    % Output:
+    %   centerline - Nx3 array of points forming the centerline
+    
+    % Check if file exists
+    if nargin < 1
+        [stlFilename, stlPath] = uigetfile({'*.stl','STL Files (*.stl)'},'Select a cochlear STL file');
+        if isequal(stlFilename, 0)
+            error('No file selected. Aborting.');
+        end
+        stlFilename = fullfile(stlPath, stlFilename);
+    end
+    
+    if ~exist(stlFilename, 'file')
+        error('STL file not found: %s. Please check the path.', stlFilename);
+    end
+    
+    % Load STL file
+    try
+        fv = stlread(stlFilename);
+        vertices = fv.Points;
+        faces = fv.ConnectivityList;
+        disp(['Loaded STL with ', num2str(size(vertices,1)), ' vertices and ', ...
+            num2str(size(faces,1)), ' faces.']);
+    catch
+        error('Could not read STL file. Make sure stlread is available or the file is valid.');
+    end
+    
+    % Visualize the STL model
+    figure('Position', [100, 100, 800, 600], 'Name', 'Cochlear STL Model');
+    trisurf(faces, vertices(:,1), vertices(:,2), vertices(:,3), ...
+        'FaceColor', [0.8, 0.8, 1.0], 'EdgeColor', 'none', 'FaceAlpha', 0.3);
+    axis equal; grid on;
+    xlabel('X (mm)'); ylabel('Y (mm)'); zlabel('Z (mm)');
+    title('Cochlear STL Model');
+    view(3); lighting gouraud; camlight; hold on;
+    
+    % 1. Identify the basal opening (entrance) of the cochlea
+    disp('Identifying basal opening...');
+    [startPoint, initialDirection] = detect_basal_opening(vertices, faces);
+    
+    % Visualize the starting point and initial direction
+    plot3(startPoint(1), startPoint(2), startPoint(3), 'go', 'MarkerSize', 10, 'MarkerFaceColor', 'g');
+    quiver3(startPoint(1), startPoint(2), startPoint(3), ...
+        initialDirection(1), initialDirection(2), initialDirection(3), 2, 'LineWidth', 2, 'Color', 'b');
+    text(startPoint(1), startPoint(2), startPoint(3), '  Start', 'Color', 'k', 'FontSize', 12);
+    drawnow;
+    
+    % 2. Extract the centerline using adaptive slicing
+    disp('Extracting centerline...');
+    rawCenterline = extract_adaptive_centerline(vertices, faces, startPoint, initialDirection);
+    
+    % 3. Apply smoothing to ensure a continuous, smooth path
+    disp('Applying smoothing to ensure centerline quality...');
+    centerline = smooth_centerline(rawCenterline);
+    
+    % Visualize the final centerline
+    plot3(centerline(:,1), centerline(:,2), centerline(:,3), 'r-', 'LineWidth', 2);
+    plot3(centerline(:,1), centerline(:,2), centerline(:,3), 'r.', 'MarkerSize', 8);
+    legend('Cochlear Surface', 'Starting Point', 'Initial Direction', 'Centerline', 'Location', 'best');
+    title('Cochlear Model with Extracted Centerline');
+    drawnow;
+    
+    % Output information about the centerline
+    disp(['Centerline extraction complete with ', num2str(size(centerline,1)), ' points.']);
+    disp('Total centerline length: ' + string(calculate_path_length(centerline)) + ' mm');
+    
+    % Return the centerline points
+end
+
+function [startPoint, initialDirection] = detect_basal_opening(vertices, faces)
+    % DETECT_BASAL_OPENING 
+    % Detects the basal opening of the cochlea and determines the initial direction
+    %
+    % Inputs:
+    %   vertices - Vertex coordinates from STL
+    %   faces - Face connectivity from STL
+    % Outputs:
+    %   startPoint - 3D coordinates of the detected basal opening centroid
+    %   initialDirection - Unit vector pointing into the cochlea from the basal opening
+
+    % 1. Identify boundary edges
+    edges = [];
+    for i = 1:size(faces, 1)
+        face = faces(i, :);
+        edges = [edges; face(1), face(2); face(2), face(3); face(3), face(1)];
+    end
+    
+    % Sort edge vertices for comparison
+    edges = sort(edges, 2);
+    
+    % Find unique edges and count occurrences
+    [uniqueEdges, ~, ic] = unique(edges, 'rows');
+    edgeCounts = accumarray(ic, 1);
+    
+    % Boundary edges appear only once
+    boundaryEdges = uniqueEdges(edgeCounts == 1, :);
+    
+    if isempty(boundaryEdges)
+        error('No boundary edges found. The STL might be a closed surface.');
+    end
+    
+    % 2. Find connected boundary edges to form boundary loops
+    boundaryLoops = find_boundary_loops(boundaryEdges);
+    
+    % 3. Calculate areas of boundary loops to identify the largest opening (basal)
+    loopAreas = zeros(length(boundaryLoops), 1);
+    loopCentroids = zeros(length(boundaryLoops), 3);
+    
+    for i = 1:length(boundaryLoops)
+        loop = boundaryLoops{i};
+        loopVertices = vertices(loop, :);
+        loopCentroids(i, :) = mean(loopVertices, 1);
+        
+        % Calculate area using the cross product method for 3D polygon
+        % First, find a best-fit plane
+        centeredPoints = loopVertices - loopCentroids(i, :);
+        [~, ~, V] = svd(centeredPoints, 'econ');
+        planeNormal = V(:, 3)';
+        
+        % Project points onto the plane
+        basis1 = V(:, 1)';
+        basis2 = V(:, 2)';
+        points2D = [centeredPoints * basis1', centeredPoints * basis2'];
+        
+        % Calculate area using shoelace formula
+        x = points2D(:, 1);
+        y = points2D(:, 2);
+        n = length(x);
+        loopAreas(i) = 0.5 * abs(sum(x .* circshift(y, [1, 0]) - circshift(x, [1, 0]) .* y));
+    end
+    
+    % Find the basal opening (largest area)
+    [~, maxAreaIdx] = max(loopAreas);
+    basalLoop = boundaryLoops{maxAreaIdx};
+    startPoint = loopCentroids(maxAreaIdx, :);
+    
+    % Visualize all boundary loops with different colors
+    cmap = jet(length(boundaryLoops));
+    for i = 1:length(boundaryLoops)
+        loop = boundaryLoops{i};
+        if i == maxAreaIdx
+            % Highlight the basal opening
+            plot3(vertices(loop, 1), vertices(loop, 2), vertices(loop, 3), 'g-', 'LineWidth', 3);
+        else
+            plot3(vertices(loop, 1), vertices(loop, 2), vertices(loop, 3), '-', 'Color', cmap(i,:));
+        end
+    end
+    
+    % 4. Determine initial direction inward from basal opening
+    basalVertices = vertices(basalLoop, :);
+    
+    % Find nearby vertices inside the cochlea (within a certain distance)
+    basalCentroid = startPoint;
+    distances = sqrt(sum((vertices - basalCentroid).^2, 2));
+    maxDist = mean(sqrt(sum((basalVertices - basalCentroid).^2, 2))) * 2;
+    nearbyIndices = find(distances < maxDist);
+    nearbyVertices = vertices(nearbyIndices, :);
+    
+    % Perform PCA on nearby vertices to find main direction
+    centeredPoints = nearbyVertices - basalCentroid;
+    [~, ~, V] = svd(centeredPoints, 'econ');
+    candidateDirection = V(:, 1)';
+    
+    % Calculate the normal to the basal opening
+    [~, ~, V] = svd(basalVertices - basalCentroid, 'econ');
+    openingNormal = V(:, 3)';
+    
+    % Ensure the direction points inward
+    if dot(candidateDirection, openingNormal) < 0
+        candidateDirection = -candidateDirection;
+    end
+    
+    % Refine direction by looking further into the cochlea
+    refinedDirection = refine_initial_direction(vertices, faces, startPoint, candidateDirection, maxDist);
+    initialDirection = refinedDirection / norm(refinedDirection);
+end
+
+function loops = find_boundary_loops(boundaryEdges)
+    % FIND_BOUNDARY_LOOPS
+    % Finds connected loops of boundary edges
+    
+    % Create a list of all unique vertices in boundary edges
+    allVertices = unique(boundaryEdges(:));
+    loops = {};
+    
+    % Create a map for quickly finding connected edges
+    vertexEdgeMap = cell(max(allVertices), 1);
+    for i = 1:size(boundaryEdges, 1)
+        v1 = boundaryEdges(i, 1);
+        v2 = boundaryEdges(i, 2);
+        
+        if v1 <= length(vertexEdgeMap)
+            vertexEdgeMap{v1} = [vertexEdgeMap{v1}, v2];
+        else
+            vertexEdgeMap{v1} = v2;
+        end
+        
+        if v2 <= length(vertexEdgeMap)
+            vertexEdgeMap{v2} = [vertexEdgeMap{v2}, v1];
+        else
+            vertexEdgeMap{v2} = v1;
+        end
+    end
+    
+    % Find complete loops
+    remainingVertices = allVertices;
+    while ~isempty(remainingVertices)
+        startVertex = remainingVertices(1);
+        currentLoop = startVertex;
+        currentVertex = startVertex;
+        
+        while true
+            % Find connected vertices
+            connected = vertexEdgeMap{currentVertex};
+            
+            % Find the next vertex in the loop that hasn't been visited yet in this loop
+            validNext = connected(~ismember(connected, currentLoop(2:end)));
+            
+            if isempty(validNext)
+                % Check if we can close the loop
+                if ismember(startVertex, connected)
+                    currentLoop = [currentLoop, startVertex];
+                end
+                break;
+            else
+                currentVertex = validNext(1);
+                currentLoop = [currentLoop, currentVertex];
+            end
+            
+            % Break if the loop is getting too large
+            if length(currentLoop) > length(allVertices)
+                break;
+            end
+        end
+        
+        % Store the loop if it forms a closed path (last vertex = first vertex)
+        if length(currentLoop) > 3 && currentLoop(1) == currentLoop(end)
+            loops{end+1} = currentLoop(1:end-1); % Remove duplicated start/end vertex
+        end
+        
+        % Remove processed vertices from the remaining list
+        remainingVertices = setdiff(remainingVertices, currentLoop);
+    end
+end
+
+function refinedDirection = refine_initial_direction(vertices, faces, startPoint, initialDirection, searchRadius)
+    % REFINE_INITIAL_DIRECTION
+    % Refines the initial direction by looking deeper into the cochlea
+
+    % Create a few test points along the initial direction
+    testDistances = linspace(searchRadius*0.5, searchRadius*2, 5);
+    testPoints = zeros(length(testDistances), 3);
+    
+    for i = 1:length(testDistances)
+        testPoints(i, :) = startPoint + testDistances(i) * initialDirection;
+    end
+    
+    % Find which test points are inside the mesh
+    insidePoints = zeros(length(testDistances), 1);
+    for i = 1:length(testDistances)
+        insidePoints(i) = is_point_inside_mesh(testPoints(i, :), vertices, faces);
+    end
+    
+    % Use the furthest inside point to refine direction
+    insideIndices = find(insidePoints);
+    if ~isempty(insideIndices)
+        furthestInside = testPoints(max(insideIndices), :);
+        refinedDirection = furthestInside - startPoint;
+    else
+        % If no points are clearly inside, use the original direction
+        refinedDirection = initialDirection;
+    end
+    
+    % Normalize the direction
+    refinedDirection = refinedDirection / norm(refinedDirection);
+end
+
+function inside = is_point_inside_mesh(point, vertices, faces)
+    % IS_POINT_INSIDE_MESH
+    % Determines if a point is inside a closed mesh using ray casting
+    % This is a simplified version - for a production environment, 
+    % more robust methods should be used
+
+    % Cast a ray in the x-direction
+    ray = [1, 0, 0];
+    intersectionCount = 0;
+    
+    % Count intersections with all faces
+    for i = 1:size(faces, 1)
+        v1 = vertices(faces(i, 1), :);
+        v2 = vertices(faces(i, 2), :);
+        v3 = vertices(faces(i, 3), :);
+        
+        if ray_triangle_intersection(point, ray, v1, v2, v3)
+            intersectionCount = intersectionCount + 1;
+        end
+    end
+    
+    % If the number of intersections is odd, the point is inside
+    inside = mod(intersectionCount, 2) == 1;
+end
+
+function intersect = ray_triangle_intersection(origin, direction, v1, v2, v3)
+    % RAY_TRIANGLE_INTERSECTION
+    % Determines if a ray intersects a triangle
+    % Möller–Trumbore intersection algorithm
+    
+    % Edge vectors
+    e1 = v2 - v1;
+    e2 = v3 - v1;
+    
+    % Calculate determinant
+    p = cross(direction, e2);
+    det = dot(e1, p);
+    
+    % If determinant is near zero, ray lies in plane of triangle
+    eps = 1e-8;
+    if abs(det) < eps
+        intersect = false;
+        return;
+    end
+    
+    inv_det = 1 / det;
+    
+    % Calculate distance from v1 to ray origin
+    t = origin - v1;
+    
+    % Calculate u parameter
+    u = dot(t, p) * inv_det;
+    
+    % Check if intersection point is outside triangle
+    if u < 0 || u > 1
+        intersect = false;
+        return;
+    end
+    
+    # Calculate v parameter and test bounds
+    q = cross(t, e1);
+    v = dot(direction, q) * inv_det;
+    
+    # Check if intersection point is outside triangle
+    if v < 0 || u + v > 1
+        intersect = false;
+        return;
+    end
+    
+    # Calculate t parameter (distance along ray)
+    t = dot(e2, q) * inv_det;
+    
+    # Intersection point is behind the ray's origin
+    if t < 0
+        intersect = false;
+        return;
+    end
+    
+    # Ray intersects triangle
+    intersect = true;
+end
+
+function centerline = extract_adaptive_centerline(vertices, faces, startPoint, initialDirection)
+    % EXTRACT_ADAPTIVE_CENTERLINE
+    % Extracts centerline using adaptive slicing perpendicular to local direction
+    
+    % Initialize parameters
+    maxPoints = 500;               % Maximum number of centerline points
+    minSliceDistance = 0.05;       % Minimum distance between slices
+    maxSliceDistance = 0.5;        % Maximum distance between slices
+    curvatureWeight = 1.5;         % How much curvature affects slice distance
+    minPointsPerSlice = 5;         % Minimum number of points needed for valid slice
+    terminationDistance = 0.8;     % Distance threshold for termination
+    
+    % Initialize centerline with starting point
+    centerline = startPoint;
+    currentDirection = initialDirection;
+    totalLength = 0;
+    previousCurvature = 0;
+    
+    % Keep track of previous slice planes for direction stability
+    prevDirections = repmat(currentDirection, 3, 1);
+    
+    % Main loop to extract centerline
+    for i = 1:maxPoints
+        % Adjust slice distance based on curvature and spiral tightening
+        sliceDistance = max(minSliceDistance, maxSliceDistance / (1 + curvatureWeight * previousCurvature));
+        
+        % Calculate next slice plane position
+        nextPoint = centerline(end, :) + sliceDistance * currentDirection;
+        
+        % Create a plane perpendicular to the current direction
+        planeNormal = currentDirection;
+        planePoint = nextPoint;
+        
+        % Find vertices near the plane
+        distToPlane = abs(dot(vertices - planePoint, planeNormal, 2));
+        tolerance = sliceDistance * 0.5; % Adjust tolerance based on slice distance
+        nearPlaneIndices = find(distToPlane < tolerance);
+        
+        % Skip if too few points found
+        if length(nearPlaneIndices) < minPointsPerSlice
+            % Reduce distance and try again
+            sliceDistance = sliceDistance * 0.8;
+            nextPoint = centerline(end, :) + sliceDistance * currentDirection;
+            planePoint = nextPoint;
+            
+            % Try again with new tolerance
+            distToPlane = abs(dot(vertices - planePoint, planeNormal, 2));
+            tolerance = sliceDistance * 0.8;
+            nearPlaneIndices = find(distToPlane < tolerance);
+            
+            % If still not enough points, try to increase tolerance
+            if length(nearPlaneIndices) < minPointsPerSlice
+                tolerance = sliceDistance * 1.5;
+                nearPlaneIndices = find(distToPlane < tolerance);
+                
+                % If still not enough, we might be at the end of the cochlea
+                if length(nearPlaneIndices) < minPointsPerSlice
+                    disp(['Terminating at point ', num2str(i), ' due to insufficient points in slice.']);
+                    break;
+                end
+            end
+        end
+        
+        % Get points in this slice
+        slicePoints = vertices(nearPlaneIndices, :);
+        
+        % Project points onto the plane
+        projectedPoints = project_points_to_plane(slicePoints, planePoint, planeNormal);
+        
+        % Find the centroid of the slice
+        sliceCentroid = mean(projectedPoints, 1);
+        
+        % Check if the centroid is inside the mesh
+        if ~is_point_inside_mesh(sliceCentroid, vertices, faces)
+            % Try to adjust the centroid by using convex hull center or weighted methods
+            try
+                % Find 2D coordinates on the plane
+                [basis1, basis2] = create_plane_basis(planeNormal);
+                centeredPoints = projectedPoints - sliceCentroid;
+                points2D = [dot(centeredPoints, basis1, 2), dot(centeredPoints, basis2, 2)];
+                
+                % Use convex hull to find better centroid
+                k = convhull(points2D);
+                hullPoints = projectedPoints(k, :);
+                betterCentroid = mean(hullPoints, 1);
+                
+                % Test if better centroid is inside
+                if is_point_inside_mesh(betterCentroid, vertices, faces)
+                    sliceCentroid = betterCentroid;
+                end
+            catch
+                % If convex hull fails, keep the original centroid
+                disp(['Warning: Centroid adjustment failed at point ', num2str(i)]);
+            end
+        end
+        
+        % Add the new centerline point
+        centerline(end+1, :) = sliceCentroid;
+        
+        % Calculate new direction based on previous points
+        if size(centerline, 1) >= 3
+            recentPoints = centerline(end-2:end, :);
+            newDirection = recentPoints(3, :) - recentPoints(1, :);
+            newDirection = newDirection / norm(newDirection);
+            
+            % Calculate curvature (approximation)
+            prevSegment = recentPoints(2, :) - recentPoints(1, :);
+            currSegment = recentPoints(3, :) - recentPoints(2, :);
+            prevSegmentNorm = norm(prevSegment);
+            currSegmentNorm = norm(currSegment);
+            
+            if prevSegmentNorm > 0 && currSegmentNorm > 0
+                prevDir = prevSegment / prevSegmentNorm;
+                currDir = currSegment / currSegmentNorm;
+                
+                % Calculate angle between segments
+                cosAngle = dot(prevDir, currDir);
+                cosAngle = min(max(cosAngle, -1), 1); % Ensure within [-1, 1]
+                angle = acos(cosAngle);
+                
+                % Curvature is approximately the angle divided by segment length
+                localCurvature = angle / ((prevSegmentNorm + currSegmentNorm) / 2);
+                previousCurvature = localCurvature;
+            end
+        else
+            newDirection = currentDirection;
+        }
+        
+        % Smooth direction changes by incorporating previous directions
+        prevDirections = [prevDirections(2:end, :); newDirection];
+        smoothedDirection = mean(prevDirections, 1);
+        currentDirection = smoothedDirection / norm(smoothedDirection);
+        
+        % Check termination conditions
+        if i > 20 % Don't check too early
+            % Calculate distance to all previous points
+            recentEnd = max(1, size(centerline, 1) - 20); % Use last 20 points
+            distances = sqrt(sum((centerline(1:recentEnd, :) - centerline(end, :)).^2, 2));
+            
+            % If we're close to any previous point (except recent ones), we might have completed the spiral
+            if any(distances < terminationDistance)
+                disp(['Terminating at point ', num2str(i), ' due to proximity to previous points.']);
+                break;
+            end
+        end
+        
+        % Calculate total path length
+        if i > 1
+            segmentLength = norm(centerline(end, :) - centerline(end-1, :));
+            totalLength = totalLength + segmentLength;
+        end
+        
+        % Show progress
+        if mod(i, 20) == 0
+            disp(['Extracted ', num2str(i), ' centerline points. Current length: ', num2str(totalLength), ' mm']);
+            % Visualize progress in real-time
+            plot3(centerline(:,1), centerline(:,2), centerline(:,3), 'r-', 'LineWidth', 1.5);
+            drawnow;
+        end
+    end
+    
+    disp(['Centerline extraction completed with ', num2str(size(centerline, 1)), ' points.']);
+end
+
+function projPoints = project_points_to_plane(points, planePoint, planeNormal)
+    % PROJECT_POINTS_TO_PLANE
+    % Projects 3D points onto a plane defined by a point and normal
+    
+    projPoints = zeros(size(points));
+    for i = 1:size(points, 1)
+        % Vector from plane point to current point
+        v = points(i, :) - planePoint;
+        
+        % Distance from point to plane
+        dist = dot(v, planeNormal);
+        
+        % Project point to plane
+        projPoints(i, :) = points(i, :) - dist * planeNormal;
+    end
+end
+
+function [basis1, basis2] = create_plane_basis(normal)
+    % CREATE_PLANE_BASIS
+    % Creates orthogonal basis vectors for a plane with the given normal
+    
+    % Find first basis vector (perpendicular to normal)
+    if abs(normal(3)) < 0.9
+        basis1 = cross(normal, [0, 0, 1]);
+    else
+        basis1 = cross(normal, [1, 0, 0]);
+    end
+    basis1 = basis1 / norm(basis1);
+    
+    # Second basis vector (perpendicular to both normal and basis1)
+    basis2 = cross(normal, basis1);
+    basis2 = basis2 / norm(basis2);
+end
+
+function smoothedCenterline = smooth_centerline(centerline)
+    % SMOOTH_CENTERLINE
+    % Applies advanced smoothing to the centerline
+    
+    % Parameters
+    numPoints = size(centerline, 1);
+    
+    if numPoints < 10
+        % Not enough points for meaningful smoothing
+        smoothedCenterline = centerline;
+        return;
+    end
+    
+    % 1. Apply a weighted moving average first
+    windowSize = min(9, floor(numPoints/5));
+    if mod(windowSize, 2) == 0
+        windowSize = windowSize + 1; % Ensure odd window size
+    end
+    
+    halfWindow = floor(windowSize/2);
+    weightedCenterline = zeros(size(centerline));
+    
+    % Create distance-based weights
+    weights = gausswin(windowSize);
+    weights = weights / sum(weights);
+    
+    % Apply weighted moving average
+    for i = 1:numPoints
+        startIdx = max(1, i - halfWindow);
+        endIdx = min(numPoints, i + halfWindow);
+        
+        % Adjust window and weights for edge points
+        actualWindow = endIdx - startIdx + 1;
+        actualWeights = zeros(actualWindow, 1);
+        
+        if actualWindow == windowSize
+            actualWeights = weights;
+        else
+            % Center the weights for truncated windows
+            if i <= halfWindow
+                actualWeights = weights(windowSize-actualWindow+1:end);
+            else
+                actualWeights = weights(1:actualWindow);
+            end
+            actualWeights = actualWeights / sum(actualWeights);
+        end
+        
+        % Weighted average of points in window
+        windowPoints = centerline(startIdx:endIdx, :);
+        weightedCenterline(i, :) = sum(windowPoints .* actualWeights, 1);
+    end
+    
+    % 2. Apply PCHIP interpolation for smoothness
+    % Calculate cumulative distance along the path
+    segments = diff(weightedCenterline);
+    segmentLengths = sqrt(sum(segments.^2, 2));
+    cumDist = [0; cumsum(segmentLengths)];
+    
+    % Create more evenly spaced points
+    newDist = linspace(0, cumDist(end), numPoints);
+    
+    % Interpolate using PCHIP for smooth, natural-looking curves
+    smoothedCenterline = zeros(numPoints, 3);
+    for dim = 1:3
+        smoothedCenterline(:,dim) = pchip(cumDist, weightedCenterline(:,dim), newDist);
+    end
+    
+    % 3. Apply a final light smoothing pass to ensure C2 continuity
+    windowSize = min(5, floor(numPoints/10));
+    if mod(windowSize, 2) == 0
+        windowSize = windowSize + 1;
+    end
+    
+    halfWindow = floor(windowSize/2);
+    finalCenterline = zeros(size(smoothedCenterline));
+    
+    for i = 1:numPoints
+        startIdx = max(1, i - halfWindow);
+        endIdx = min(numPoints, i + halfWindow);
+        finalCenterline(i, :) = mean(smoothedCenterline(startIdx:endIdx, :), 1);
+    end
+    
+    smoothedCenterline = finalCenterline;
+    
+    % Verify the smoothed centerline stays inside the cochlea
+    % This would require additional implementation in a production environment
+end
+
+function length = calculate_path_length(path)
+    % CALCULATE_PATH_LENGTH
+    % Calculates the total length of a 3D path
+    
+    segments = diff(path);
+    segmentLengths = sqrt(sum(segments.^2, 2));
+    length = sum(segmentLengths);
+end
