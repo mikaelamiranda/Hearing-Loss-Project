@@ -1,0 +1,64 @@
+import trimesh
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from skimage.morphology import skeletonize_3d
+from scipy.ndimage import binary_fill_holes, zoom
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+# === Step 1: Load STL Mesh ===
+mesh_path = "TestPipe.STL"
+tri_mesh = trimesh.load(mesh_path)
+
+# === Step 2: Voxelize at Safe Resolution ===
+voxel_pitch = 3.0
+voxelized = tri_mesh.voxelized(pitch=voxel_pitch)
+volume = voxelized.matrix.astype(np.uint8)
+filled = binary_fill_holes(volume)
+skeleton = skeletonize_3d(filled)
+skeleton_pts = np.argwhere(skeleton)  # voxel coordinates
+
+# === FIX: Use transform matrix to compute origin ===
+origin = voxelized.transform[:3, 3]  # translation vector from voxel grid to mesh space
+skeleton_pts_world = skeleton_pts * voxel_pitch + origin  # convert to world coords
+
+# === Step 3: Save Data to CSV ===
+skeleton_df = pd.DataFrame(skeleton_pts_world, columns=["X", "Y", "Z"])
+mesh_vertices_df = pd.DataFrame(tri_mesh.vertices, columns=["X", "Y", "Z"])
+mesh_faces_df = pd.DataFrame(tri_mesh.faces, columns=["V1", "V2", "V3"])
+
+skeleton_df.to_csv("skeleton_midline.csv", index=False)
+mesh_vertices_df.to_csv("mesh_vertices.csv", index=False)
+mesh_faces_df.to_csv("mesh_faces.csv", index=False)
+
+# === Step 4: 3D Visualization ===
+fig = plt.figure(figsize=(10, 8))
+ax = fig.add_subplot(111, projection='3d')
+
+# Plot Skeleton Midline (in world coordinates)
+ax.scatter(skeleton_pts_world[:, 0], skeleton_pts_world[:, 1], skeleton_pts_world[:, 2],
+           c='red', s=2, label='Skeleton Midline')
+
+# Plot Original Mesh (light gray, 10% opacity)
+mesh_faces = tri_mesh.faces
+mesh_vertices = tri_mesh.vertices
+mesh_poly = Poly3DCollection(mesh_vertices[mesh_faces], alpha=0.1, facecolor='gray', edgecolor='none')
+ax.add_collection3d(mesh_poly)
+
+# Format Axes
+ax.set_title("3D Skeleton Midline with Original Mesh Overlay")
+ax.set_xlabel("X")
+ax.set_ylabel("Y")
+ax.set_zlabel("Z")
+
+pad = 5
+min_xyz = np.minimum(skeleton_pts_world.min(axis=0), mesh_vertices.min(axis=0)) - pad
+max_xyz = np.maximum(skeleton_pts_world.max(axis=0), mesh_vertices.max(axis=0)) + pad
+
+ax.set_xlim([min_xyz[0], max_xyz[0]])
+ax.set_ylim([min_xyz[1], max_xyz[1]])
+ax.set_zlim([min_xyz[2], max_xyz[2]])
+
+ax.legend()
+plt.tight_layout()
+plt.show()
